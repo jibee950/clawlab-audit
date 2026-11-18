@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clawlab-audit"
+version = "0.1.0"
+description = "Lightweight execution auditing for Python agents"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "ClawLab"}]
+
+[tool.setuptools]
+packages = ["clawlab"]
