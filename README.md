@@ -287,6 +287,6 @@ See the `LICENSE` file for details.
 
 ## Version
 
-Current published version: **0.1.0**
+Current release version: **0.2.0**
 
-Development of the next release is ongoing.
+This release includes expanded auditing, reporting and anomaly detection features.

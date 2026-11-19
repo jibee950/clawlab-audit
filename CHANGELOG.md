@@ -2,7 +2,7 @@
 
 All notable changes to ClawLab Audit are documented here.
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-11-19
 
 ### Added
 - Operation search and detailed inspection.
