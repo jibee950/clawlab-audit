@@ -1,11 +1,13 @@
+import base64
+import errno
 import functools
+import math
 import os
 
 if os.name == "nt":
     import msvcrt
 else:
     import fcntl
-import shutil
 import hashlib
 import inspect
 import json
@@ -14,18 +16,30 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 JOURNAL = Path.home() / ".config" / "clawlab" / "sdk_audit.json"
+SIGNING_KEY = Path.home() / ".config" / "clawlab" / "audit_signing_key.pem"
 
 
 def _verrouiller(lock):
     if os.name == "nt":
-        lock.seek(0)
-        if lock.read(1) == "":
+        # Le fichier est créé par open("a+"). Ne pas lire l'octet ici :
+        # sous Windows, un autre thread qui détient déjà le verrou peut
+        # rendre cette lecture elle-même fautive avec PermissionError.
+        while True:
             lock.seek(0)
-            lock.write("0")
-            lock.flush()
-        lock.seek(0)
-        msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as erreur:
+                if erreur.errno not in (errno.EACCES, errno.EDEADLK):
+                    raise
+                # LK_LOCK abandonne après dix tentatives; réessayer le verrou
+                # non bloquant évite de perdre un producteur lors d'une écriture lente.
+                time.sleep(0.01)
     else:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
 
@@ -46,8 +60,229 @@ def _empreinte(data):
     return hashlib.sha256(contenu).hexdigest()
 
 
+
+
+def _synchroniser_repertoire(chemin):
+    """Synchronise le répertoire après un remplacement atomique."""
+    if os.name == "nt":
+        return
+
+    descripteur = os.open(str(chemin.parent), os.O_RDONLY)
+    try:
+        os.fsync(descripteur)
+    finally:
+        os.close(descripteur)
+
+
+def _chemin_checkpoint():
+    return JOURNAL.with_name(JOURNAL.name + ".checkpoint")
+
+
+def _chemin_checkpoint_backup():
+    return JOURNAL.with_name(JOURNAL.name + ".bak.checkpoint")
+
+
+def _charger_cle_signature():
+    """Charge ou crée la clé Ed25519 locale, séparée des fichiers du journal."""
+    SIGNING_KEY.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        cle = serialization.load_pem_private_key(
+            SIGNING_KEY.read_bytes(), password=None
+        )
+        if not isinstance(cle, Ed25519PrivateKey):
+            raise ValueError("La clé locale n'est pas une clé Ed25519.")
+        return cle
+    except FileNotFoundError:
+        cle = Ed25519PrivateKey.generate()
+        contenu = cle.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        temporaire = SIGNING_KEY.with_name(
+            "." + SIGNING_KEY.name + "." + uuid.uuid4().hex + ".tmp"
+        )
+        try:
+            with temporaire.open("xb") as fichier:
+                os.chmod(temporaire, 0o600)
+                fichier.write(contenu)
+                fichier.flush()
+                os.fsync(fichier.fileno())
+            try:
+                # Lien exclusif : deux premiers démarrages concurrents ne
+                # peuvent pas remplacer la clé l'un de l'autre.
+                os.link(temporaire, SIGNING_KEY)
+            except FileExistsError:
+                cle_existante = serialization.load_pem_private_key(
+                    SIGNING_KEY.read_bytes(), password=None
+                )
+                if not isinstance(cle_existante, Ed25519PrivateKey):
+                    raise ValueError("La clé locale n'est pas une clé Ed25519.")
+                return cle_existante
+            _synchroniser_repertoire(SIGNING_KEY)
+            return cle
+        finally:
+            temporaire.unlink(missing_ok=True)
+
+
+def _instantane_checkpoint(operations):
+    return {
+        "version": 1,
+        "count": len(operations),
+        "last_id": operations[-1]["id"] if operations else None,
+        "last_hash": operations[-1]["hash"] if operations else "GENESIS",
+    }
+
+
+def _checkpoint_signe(operations):
+    instantane = _instantane_checkpoint(operations)
+    cle = _charger_cle_signature()
+    signature = cle.sign(
+        json.dumps(
+            instantane, sort_keys=True, ensure_ascii=False
+        ).encode("utf-8")
+    )
+    return {
+        "version": 2,
+        "snapshot": instantane,
+        "signature": base64.b64encode(signature).decode("ascii"),
+    }
+
+
+def _verifier_checkpoint_signe(checkpoint):
+    if not isinstance(checkpoint, dict) or checkpoint.get("version") != 2:
+        return False
+    try:
+        instantane = checkpoint["snapshot"]
+        signature = base64.b64decode(checkpoint["signature"], validate=True)
+        cle = _charger_cle_signature()
+        cle.public_key().verify(
+            signature,
+            json.dumps(
+                instantane, sort_keys=True, ensure_ascii=False
+            ).encode("utf-8"),
+        )
+        return True
+    except (KeyError, TypeError, ValueError, InvalidSignature):
+        return False
+
+
+def _ecrire_checkpoint(operations, chemin=None):
+    chemin = chemin or _chemin_checkpoint()
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    temporaire = chemin.with_name(
+        "." + chemin.name + "." + uuid.uuid4().hex + ".tmp"
+    )
+    try:
+        with temporaire.open("x", encoding="utf-8") as f:
+            os.chmod(temporaire, 0o600)
+            json.dump(_checkpoint_signe(operations), f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporaire, chemin)
+        _synchroniser_repertoire(chemin)
+    finally:
+        if temporaire.exists():
+            temporaire.unlink()
+
+
+def _verifier_checkpoint(operations, chemin=None):
+    chemin = chemin or _chemin_checkpoint()
+    try:
+        checkpoint = json.loads(chemin.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as erreur:
+        raise ValueError("Checkpoint absent ou illisible.") from erreur
+
+    if isinstance(checkpoint, dict) and checkpoint.get("version") == 2:
+        if not _verifier_checkpoint_signe(checkpoint):
+            raise ValueError("Signature du checkpoint invalide.")
+        instantane = checkpoint.get("snapshot")
+    else:
+        # Migration transparente des checkpoints historiques non signés.
+        instantane = checkpoint
+
+    if instantane != _instantane_checkpoint(operations):
+        raise ValueError(
+            "Checkpoint incohérent : suppression ou modification du journal détectée."
+        )
+    if not (isinstance(checkpoint, dict) and checkpoint.get("version") == 2):
+        _ecrire_checkpoint(operations, chemin)
+
+
+
+def _ecrire_sauvegarde_atomique(operations):
+    chemin = JOURNAL.with_name(JOURNAL.name + ".bak")
+    temporaire = chemin.with_name(
+        "." + chemin.name + "." + uuid.uuid4().hex + ".tmp"
+    )
+    donnees = {
+        "version": 2,
+        "operations": operations,
+        "checkpoint": _checkpoint_signe(operations),
+    }
+    try:
+        with temporaire.open("x", encoding="utf-8") as f:
+            os.chmod(temporaire, 0o600)
+            json.dump(donnees, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporaire, chemin)
+        _synchroniser_repertoire(chemin)
+    finally:
+        if temporaire.exists():
+            temporaire.unlink()
+
+
+def _charger_sauvegarde(chemin=None):
+    chemin = chemin or JOURNAL.with_name(JOURNAL.name + ".bak")
+    try:
+        donnees = json.loads(chemin.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as erreur:
+        raise ValueError("Sauvegarde illisible.") from erreur
+
+    if isinstance(donnees, dict):
+        version = donnees.get("version")
+        if version not in (1, 2):
+            raise ValueError("Version de sauvegarde inconnue.")
+        operations = donnees.get("operations")
+        checkpoint = donnees.get("checkpoint")
+        if not isinstance(operations, list):
+            raise ValueError("Format de sauvegarde invalide.")
+        if not _verifier_liste_operations(operations):
+            raise ValueError("Intégrité de la sauvegarde invalide.")
+        if version == 2:
+            if (
+                not _verifier_checkpoint_signe(checkpoint)
+                or checkpoint.get("snapshot") != _instantane_checkpoint(operations)
+            ):
+                raise ValueError("Checkpoint signé intégré à la sauvegarde invalide.")
+        elif checkpoint != _instantane_checkpoint(operations):
+            raise ValueError("Checkpoint intégré à la sauvegarde invalide.")
+
+    elif isinstance(donnees, list):
+        # Compatibilité avec les anciennes sauvegardes.
+        operations = donnees
+        if not _verifier_liste_operations(operations):
+            raise ValueError("Intégrité de la sauvegarde invalide.")
+
+        ancien_checkpoint = _chemin_checkpoint_backup()
+        if ancien_checkpoint.exists():
+            _verifier_checkpoint(operations, ancien_checkpoint)
+        elif _chemin_checkpoint().exists():
+            raise ValueError("Checkpoint de l'ancienne sauvegarde absent.")
+
+    else:
+        raise ValueError("Format de sauvegarde invalide.")
+
+    return operations
+
+
 def _charger_operations():
+    checkpoint = _chemin_checkpoint()
+
     if not JOURNAL.exists():
+        if checkpoint.exists():
+            raise ValueError("Journal absent alors qu'un checkpoint existe.")
         return []
 
     try:
@@ -62,8 +297,47 @@ def _charger_operations():
     if not _verifier_liste_operations(operations):
         raise ValueError("Intégrité du journal invalide.")
 
+    if checkpoint.exists():
+        _verifier_checkpoint(operations)
+    else:
+        if _chemin_checkpoint_backup().exists():
+            raise ValueError("Checkpoint principal absent : vérification refusée.")
+        sauvegarde = JOURNAL.with_name(JOURNAL.name + ".bak")
+        if sauvegarde.exists():
+            try:
+                donnees_sauvegarde = json.loads(
+                    sauvegarde.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError) as erreur:
+                raise ValueError(
+                    "Checkpoint principal absent : sauvegarde illisible."
+                ) from erreur
+
+            if not isinstance(donnees_sauvegarde, list):
+                raise ValueError(
+                    "Checkpoint principal absent : migration refusée."
+                )
+
+        # Migration d'un journal historique valide.
+        _ecrire_checkpoint(operations)
+
     return operations
 
+
+
+def _remplacer_octets_atomiquement(chemin, contenu):
+    temp = chemin.with_name("." + chemin.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with temp.open("xb") as fichier:
+            os.chmod(temp, 0o600)
+            fichier.write(contenu)
+            fichier.flush()
+            os.fsync(fichier.fileno())
+        os.replace(temp, chemin)
+        _synchroniser_repertoire(chemin)
+    finally:
+        if temp.exists():
+            temp.unlink()
 
 
 def _enregistrer(
@@ -74,7 +348,6 @@ def _enregistrer(
 
     verrou = JOURNAL.with_name(JOURNAL.name + ".lock")
     temporaire = None
-    backup_temp = None
 
     with verrou.open("a+") as lock:
         os.chmod(verrou, 0o600)
@@ -82,6 +355,9 @@ def _enregistrer(
 
         try:
             operations = _charger_operations()
+            checkpoint = _chemin_checkpoint()
+            ancien_journal = JOURNAL.read_bytes() if JOURNAL.exists() else None
+            ancien_checkpoint = checkpoint.read_bytes() if checkpoint.exists() else None
             precedent = operations[-1]["hash"] if operations else "GENESIS"
 
             operation = {
@@ -110,32 +386,44 @@ def _enregistrer(
                 f.flush()
                 os.fsync(f.fileno())
 
-            # Sauvegarder le journal précédent avant remplacement
+            # Sauvegarde atomique du journal précédent.
             if JOURNAL.exists():
-                backup = JOURNAL.with_name(JOURNAL.name + ".bak")
-                backup_temp = backup.with_name(
-                    "." + backup.name + "." + uuid.uuid4().hex + ".tmp"
-                )
-
-                with JOURNAL.open("rb") as source:
-                    with backup_temp.open("xb") as destination:
-                        shutil.copyfileobj(source, destination)
-                        destination.flush()
-                        os.fsync(destination.fileno())
-
-                os.chmod(backup_temp, 0o600)
-                os.replace(backup_temp, backup)
-                backup_temp = None
+                _ecrire_sauvegarde_atomique(operations[:-1])
 
             os.replace(temporaire, JOURNAL)
+            _synchroniser_repertoire(JOURNAL)
             temporaire = None
+            try:
+                _ecrire_checkpoint(operations)
+            except Exception as erreur_checkpoint:
+                erreurs_retour = []
+
+                try:
+                    if ancien_checkpoint is None:
+                        checkpoint.unlink(missing_ok=True)
+                    else:
+                        _remplacer_octets_atomiquement(checkpoint, ancien_checkpoint)
+                except Exception as retour:
+                    erreurs_retour.append("checkpoint : " + str(retour))
+
+                try:
+                    if ancien_journal is None:
+                        JOURNAL.unlink(missing_ok=True)
+                    else:
+                        _remplacer_octets_atomiquement(JOURNAL, ancien_journal)
+                except Exception as retour:
+                    erreurs_retour.append("journal : " + str(retour))
+
+                if erreurs_retour:
+                    raise RuntimeError(
+                        "Échec du checkpoint et du retour arrière : "
+                        + "; ".join(erreurs_retour)
+                    ) from erreur_checkpoint
+                raise
 
         finally:
             if temporaire is not None and temporaire.exists():
                 temporaire.unlink()
-
-            if backup_temp is not None and backup_temp.exists():
-                backup_temp.unlink()
 
             _deverrouiller(lock)
 
@@ -763,6 +1051,7 @@ def _verifier_liste_operations(operations):
             if (
                 isinstance(duree, bool)
                 or not isinstance(duree, (int, float))
+                or not math.isfinite(duree)
                 or duree < 0
             ):
                 return False
@@ -795,66 +1084,105 @@ def restaurer_sauvegarde():
     JOURNAL.parent.mkdir(parents=True, exist_ok=True)
 
     backup = JOURNAL.with_name(JOURNAL.name + ".bak")
+    checkpoint = _chemin_checkpoint()
     verrou = JOURNAL.with_name(JOURNAL.name + ".lock")
     temporaire = None
 
+    def remplacer_octets(chemin, contenu):
+        temp = chemin.with_name(
+            "." + chemin.name + "." + uuid.uuid4().hex + ".tmp"
+        )
+        try:
+            with temp.open("xb") as f:
+                os.chmod(temp, 0o600)
+                f.write(contenu)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp, chemin)
+            _synchroniser_repertoire(chemin)
+        finally:
+            if temp.exists():
+                temp.unlink()
+
     with verrou.open("a+") as lock:
+        os.chmod(verrou, 0o600)
         _verrouiller(lock)
 
         try:
-            # Ne jamais remplacer un journal valide.
-            try:
-                actuel = json.loads(
-                    JOURNAL.read_text(encoding="utf-8")
-                )
-                if _verifier_liste_operations(actuel):
+            if JOURNAL.exists():
+                try:
+                    _charger_operations()
                     print("Journal actuel valide. Restauration inutile.")
                     return False
-            except Exception:
-                pass
+                except (ValueError, OSError):
+                    pass
 
-            # Vérifier la sauvegarde.
             try:
-                contenu_backup = backup.read_bytes()
-                operations = json.loads(
-                    contenu_backup.decode("utf-8")
-                )
-            except Exception:
-                print("Sauvegarde illisible ou absente.")
+                operations = _charger_sauvegarde(backup)
+            except (ValueError, OSError) as erreur:
+                print("Sauvegarde invalide :", erreur)
                 return False
 
-            if not _verifier_liste_operations(operations):
-                print("Sauvegarde invalide. Restauration refusée.")
-                return False
+            ancien_journal = (
+                JOURNAL.read_bytes() if JOURNAL.exists() else None
+            )
+            ancien_checkpoint = (
+                checkpoint.read_bytes() if checkpoint.exists() else None
+            )
 
-            # Préserver le journal endommagé.
-            if JOURNAL.exists():
+            if ancien_journal is not None:
                 corrompu = JOURNAL.with_name(
-                    JOURNAL.name + ".corrompu-" +
-                    uuid.uuid4().hex
+                    JOURNAL.name + ".corrompu-" + uuid.uuid4().hex
                 )
-                with corrompu.open("xb") as f:
-                    f.write(JOURNAL.read_bytes())
-                    f.flush()
-                    os.fsync(f.fileno())
-
-                os.chmod(corrompu, 0o600)
+                remplacer_octets(corrompu, ancien_journal)
                 print("Ancien journal préservé :", corrompu)
 
-            # Préparer puis remplacer le journal.
+            contenu = json.dumps(
+                operations, ensure_ascii=False, indent=2
+            ).encode("utf-8")
+
             temporaire = JOURNAL.with_name(
-                "." + JOURNAL.name + "." +
-                uuid.uuid4().hex + ".tmp"
+                "." + JOURNAL.name + "." + uuid.uuid4().hex + ".tmp"
             )
 
             with temporaire.open("xb") as f:
-                f.write(contenu_backup)
+                os.chmod(temporaire, 0o600)
+                f.write(contenu)
                 f.flush()
                 os.fsync(f.fileno())
 
-            os.chmod(temporaire, 0o600)
             os.replace(temporaire, JOURNAL)
+            _synchroniser_repertoire(JOURNAL)
             temporaire = None
+
+            try:
+                _ecrire_checkpoint(operations)
+            except Exception as erreur:
+                erreurs_retour = []
+
+                try:
+                    if ancien_checkpoint is None:
+                        checkpoint.unlink(missing_ok=True)
+                    else:
+                        remplacer_octets(checkpoint, ancien_checkpoint)
+                except Exception as retour:
+                    erreurs_retour.append("checkpoint : " + str(retour))
+
+                try:
+                    if ancien_journal is None:
+                        JOURNAL.unlink(missing_ok=True)
+                    else:
+                        remplacer_octets(JOURNAL, ancien_journal)
+                except Exception as retour:
+                    erreurs_retour.append("journal : " + str(retour))
+
+                if erreurs_retour:
+                    raise RuntimeError(
+                        "Échec du checkpoint et du retour arrière : "
+                        + "; ".join(erreurs_retour)
+                    ) from erreur
+
+                raise
 
             print("Restauration effectuée.")
             print("Opérations restaurées :", len(operations))
@@ -863,7 +1191,6 @@ def restaurer_sauvegarde():
         finally:
             if temporaire is not None and temporaire.exists():
                 temporaire.unlink()
-
             _deverrouiller(lock)
 
 

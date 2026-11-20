@@ -3,6 +3,9 @@ import contextlib
 import csv
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -16,10 +19,13 @@ class ClawLabTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.ancien_journal = clawlab.JOURNAL
+        self.ancienne_cle = clawlab.SIGNING_KEY
+        clawlab.SIGNING_KEY = Path(self.tempdir.name) / "audit_signing_key.pem"
         clawlab.JOURNAL = Path(self.tempdir.name) / "sdk_audit.json"
 
     def tearDown(self):
         clawlab.JOURNAL = self.ancien_journal
+        clawlab.SIGNING_KEY = self.ancienne_cle
         self.tempdir.cleanup()
 
     def test_empreinte_deterministe(self):
@@ -168,12 +174,20 @@ class ClawLabTests(unittest.TestCase):
                 f"operation_{numero}", "success", 1
             )
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            list(executor.map(enregistrer, range(15)))
+        attendues = {f"operation_{numero}" for numero in range(50)}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            list(executor.map(enregistrer, range(50)))
 
         operations = clawlab._charger_operations()
 
-        self.assertEqual(len(operations), 15)
+        self.assertEqual(len(operations), len(attendues))
+        self.assertEqual(
+            {operation["action"] for operation in operations}, attendues
+        )
+        self.assertEqual(
+            len({operation["id"] for operation in operations}),
+            len(attendues)
+        )
         self.assertTrue(
             clawlab._verifier_liste_operations(operations)
         )
@@ -188,10 +202,13 @@ class ClawLabAdvancedTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.ancien_journal = clawlab.JOURNAL
+        self.ancienne_cle = clawlab.SIGNING_KEY
+        clawlab.SIGNING_KEY = Path(self.tempdir.name) / "audit_signing_key.pem"
         clawlab.JOURNAL = Path(self.tempdir.name) / "sdk_audit.json"
 
     def tearDown(self):
         clawlab.JOURNAL = self.ancien_journal
+        clawlab.SIGNING_KEY = self.ancienne_cle
         self.tempdir.cleanup()
 
 
@@ -285,10 +302,13 @@ class ClawLabRobustnessTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.ancien_journal = clawlab.JOURNAL
+        self.ancienne_cle = clawlab.SIGNING_KEY
+        clawlab.SIGNING_KEY = Path(self.tempdir.name) / "audit_signing_key.pem"
         clawlab.JOURNAL = Path(self.tempdir.name) / "sdk_audit.json"
 
     def tearDown(self):
         clawlab.JOURNAL = self.ancien_journal
+        clawlab.SIGNING_KEY = self.ancienne_cle
         self.tempdir.cleanup()
 
     def test_json_illisible(self):
@@ -343,10 +363,13 @@ class ClawLabSchemaTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.ancien_journal = clawlab.JOURNAL
+        self.ancienne_cle = clawlab.SIGNING_KEY
+        clawlab.SIGNING_KEY = Path(self.tempdir.name) / "audit_signing_key.pem"
         clawlab.JOURNAL = Path(self.tempdir.name) / "sdk_audit.json"
 
     def tearDown(self):
         clawlab.JOURNAL = self.ancien_journal
+        clawlab.SIGNING_KEY = self.ancienne_cle
         self.tempdir.cleanup()
 
     def creer_operation(self):
@@ -367,6 +390,21 @@ class ClawLabSchemaTests(unittest.TestCase):
     def test_duree_negative(self):
         self.verifier_rejet(lambda op: op.update(duree_ms=-1))
 
+    def test_duree_non_finie(self):
+        for valeur in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(duree=valeur):
+                operations = self.creer_operation()
+                operations[0]["duree_ms"] = valeur
+                contenu = {
+                    k: v for k, v in operations[0].items()
+                    if k != "hash"
+                }
+                operations[0]["hash"] = clawlab._empreinte(contenu)
+
+                self.assertFalse(
+                    clawlab._verifier_liste_operations(operations)
+                )
+
     def test_date_invalide(self):
         self.verifier_rejet(lambda op: op.update(date="date-invalide"))
 
@@ -379,10 +417,13 @@ class ClawLabCrashTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.ancien_journal = clawlab.JOURNAL
+        self.ancienne_cle = clawlab.SIGNING_KEY
+        clawlab.SIGNING_KEY = Path(self.tempdir.name) / "audit_signing_key.pem"
         clawlab.JOURNAL = Path(self.tempdir.name) / "sdk_audit.json"
 
     def tearDown(self):
         clawlab.JOURNAL = self.ancien_journal
+        clawlab.SIGNING_KEY = self.ancienne_cle
         self.tempdir.cleanup()
 
     def test_echec_ecriture_preserve_journal(self):
@@ -408,16 +449,75 @@ class ClawLabCrashTests(unittest.TestCase):
         self.assertEqual(avant, apres)
         self.assertTrue(clawlab.verifier_integrite())
 
+    def test_crash_apres_remplacement_journal_restaure_evenement_commis(self):
+        script = """
+import os
+from pathlib import Path
+import clawlab
+
+clawlab.JOURNAL = Path(os.environ["CLAWLAB_TEST_JOURNAL"])
+clawlab.SIGNING_KEY = Path(os.environ["CLAWLAB_TEST_SIGNING_KEY"])
+ecriture_checkpoint_originale = clawlab._ecrire_checkpoint
+nombre_appels_checkpoint = 0
+
+def interrompre_apres_remplacement(operations, chemin=None):
+    global nombre_appels_checkpoint
+    if chemin is None:
+        nombre_appels_checkpoint += 1
+        if nombre_appels_checkpoint == 2:
+            os._exit(73)
+    return ecriture_checkpoint_originale(operations, chemin)
+
+clawlab._ecrire_checkpoint = interrompre_apres_remplacement
+clawlab._enregistrer("operation_commise", "success", 10)
+clawlab._enregistrer("operation_interrompue", "success", 20)
+"""
+        environnement = os.environ.copy()
+        environnement["CLAWLAB_TEST_JOURNAL"] = str(clawlab.JOURNAL)
+        environnement["CLAWLAB_TEST_SIGNING_KEY"] = str(clawlab.SIGNING_KEY)
+        racine_projet = Path(__file__).resolve().parents[1]
+
+        processus = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=racine_projet,
+            env=environnement,
+            capture_output=True,
+            timeout=30,
+        )
+
+        self.assertEqual(processus.returncode, 73)
+        journal_interrompu = clawlab.JOURNAL.read_bytes()
+        with self.assertRaises(ValueError):
+            clawlab._charger_operations()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(clawlab.restaurer_sauvegarde())
+
+        operations = clawlab._charger_operations()
+        self.assertEqual(len(operations), 1)
+        self.assertEqual(operations[0]["action"], "operation_commise")
+
+        copies = list(
+            clawlab.JOURNAL.parent.glob(
+                clawlab.JOURNAL.name + ".corrompu-*"
+            )
+        )
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0].read_bytes(), journal_interrompu)
+
 
 class ClawLabRecoveryTests(unittest.TestCase):
 
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.ancien_journal = clawlab.JOURNAL
+        self.ancienne_cle = clawlab.SIGNING_KEY
+        clawlab.SIGNING_KEY = Path(self.tempdir.name) / "audit_signing_key.pem"
         clawlab.JOURNAL = Path(self.tempdir.name) / "sdk_audit.json"
 
     def tearDown(self):
         clawlab.JOURNAL = self.ancien_journal
+        clawlab.SIGNING_KEY = self.ancienne_cle
         self.tempdir.cleanup()
 
     def test_restauration_apres_corruption(self):
@@ -427,9 +527,10 @@ class ClawLabRecoveryTests(unittest.TestCase):
         backup = clawlab.JOURNAL.with_name(
             clawlab.JOURNAL.name + ".bak"
         )
-        operations_backup = json.loads(
+        donnees_backup = json.loads(
             backup.read_text(encoding="utf-8")
         )
+        operations_backup = donnees_backup["operations"]
 
         clawlab.JOURNAL.write_text(
             "journal corrompu", encoding="utf-8"
@@ -460,10 +561,13 @@ class ClawLabAnomalyTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.ancien_journal = clawlab.JOURNAL
+        self.ancienne_cle = clawlab.SIGNING_KEY
+        clawlab.SIGNING_KEY = Path(self.tempdir.name) / "audit_signing_key.pem"
         clawlab.JOURNAL = Path(self.tempdir.name) / "sdk_audit.json"
 
     def tearDown(self):
         clawlab.JOURNAL = self.ancien_journal
+        clawlab.SIGNING_KEY = self.ancienne_cle
         self.tempdir.cleanup()
 
     def test_journal_vide(self):
@@ -523,10 +627,13 @@ class ClawLabRepeatedToolTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.ancien_journal = clawlab.JOURNAL
+        self.ancienne_cle = clawlab.SIGNING_KEY
+        clawlab.SIGNING_KEY = Path(self.tempdir.name) / "audit_signing_key.pem"
         clawlab.JOURNAL = Path(self.tempdir.name) / "sdk_audit.json"
 
     def tearDown(self):
         clawlab.JOURNAL = self.ancien_journal
+        clawlab.SIGNING_KEY = self.ancienne_cle
         self.tempdir.cleanup()
 
     def test_alerte_apres_trois_echecs(self):
@@ -568,10 +675,13 @@ class ClawLabHtmlAlertTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.ancien_journal = clawlab.JOURNAL
+        self.ancienne_cle = clawlab.SIGNING_KEY
+        clawlab.SIGNING_KEY = Path(self.tempdir.name) / "audit_signing_key.pem"
         clawlab.JOURNAL = Path(self.tempdir.name) / "sdk_audit.json"
 
     def tearDown(self):
         clawlab.JOURNAL = self.ancien_journal
+        clawlab.SIGNING_KEY = self.ancienne_cle
         self.tempdir.cleanup()
 
     def test_alerte_critique_dans_rapport_html(self):
@@ -593,3 +703,386 @@ class ClawLabHtmlAlertTests(unittest.TestCase):
         self.assertIn("ALERTE OUTIL", contenu)
         self.assertIn("outil-test", contenu)
         self.assertIn("critical-alert", contenu)
+
+
+class ClawLabIntegrityAttackTests(unittest.TestCase):
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.ancien_journal = clawlab.JOURNAL
+        self.ancienne_cle = clawlab.SIGNING_KEY
+        clawlab.SIGNING_KEY = Path(self.tempdir.name) / "audit_signing_key.pem"
+        clawlab.JOURNAL = Path(self.tempdir.name) / "sdk_audit.json"
+
+        for numero in range(3):
+            clawlab._enregistrer(
+                f"operation_{numero}", "success", 10
+            )
+
+        self.operations = clawlab._charger_operations()
+
+    def tearDown(self):
+        clawlab.JOURNAL = self.ancien_journal
+        clawlab.SIGNING_KEY = self.ancienne_cle
+        self.tempdir.cleanup()
+
+    def test_refuse_modification_sans_recalcul(self):
+        operations = [dict(o) for o in self.operations]
+        operations[1]["action"] = "action_falsifiee"
+
+        self.assertFalse(
+            clawlab._verifier_liste_operations(operations)
+        )
+
+    def test_refuse_suppression_dune_operation_intermediaire(self):
+        operations = [dict(o) for o in self.operations]
+        del operations[1]
+
+        self.assertFalse(
+            clawlab._verifier_liste_operations(operations)
+        )
+
+    def test_refuse_insertion_non_recalculee(self):
+        operations = [dict(o) for o in self.operations]
+        operations.insert(1, dict(operations[0]))
+
+        self.assertFalse(
+            clawlab._verifier_liste_operations(operations)
+        )
+
+    def test_refuse_reordonnancement(self):
+        operations = [dict(o) for o in self.operations]
+        operations[0], operations[1] = operations[1], operations[0]
+
+        self.assertFalse(
+            clawlab._verifier_liste_operations(operations)
+        )
+
+    def test_limite_suppression_derniere_operation(self):
+        operations = [dict(o) for o in self.operations]
+        del operations[-1]
+
+        # Sans point de contrôle externe, la suppression de la fin
+        # de la chaîne n'est pas détectable.
+        self.assertTrue(
+            clawlab._verifier_liste_operations(operations)
+        )
+
+    def test_limite_recalcul_complet_de_la_chaine(self):
+        operations = [dict(o) for o in self.operations]
+        operations[0]["action"] = "historique_reconstruit"
+
+        precedent = "GENESIS"
+        for operation in operations:
+            operation["previous_hash"] = precedent
+            contenu = {
+                k: v for k, v in operation.items() if k != "hash"
+            }
+            operation["hash"] = clawlab._empreinte(contenu)
+            precedent = operation["hash"]
+
+        # Une chaîne entièrement recalculée est valide :
+        # le hash local ne prouve pas l'authenticité historique.
+        self.assertTrue(
+            clawlab._verifier_liste_operations(operations)
+        )
+
+
+class ClawLabCheckpointTests(unittest.TestCase):
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.ancien_journal = clawlab.JOURNAL
+        self.ancienne_cle = clawlab.SIGNING_KEY
+        clawlab.SIGNING_KEY = Path(self.tempdir.name) / "audit_signing_key.pem"
+        clawlab.JOURNAL = Path(self.tempdir.name) / "sdk_audit.json"
+
+    def tearDown(self):
+        clawlab.JOURNAL = self.ancien_journal
+        clawlab.SIGNING_KEY = self.ancienne_cle
+        self.tempdir.cleanup()
+
+    def test_echec_checkpoint_sauvegarde_preserve_journal(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+
+        original = clawlab._ecrire_sauvegarde_atomique
+
+        def simuler_interruption(operations):
+            raise OSError("Echec sauvegarde atomique")
+
+        clawlab._ecrire_sauvegarde_atomique = simuler_interruption
+        try:
+            with self.assertRaisesRegex(OSError, "Echec sauvegarde atomique"):
+                clawlab._enregistrer("operation_2", "success", 20)
+        finally:
+            clawlab._ecrire_sauvegarde_atomique = original
+
+        operations = clawlab._charger_operations()
+        self.assertEqual(len(operations), 1)
+        self.assertEqual(operations[0]["action"], "operation_1")
+
+        clawlab._enregistrer("operation_2", "success", 20)
+        operations = clawlab._charger_operations()
+        self.assertEqual(len(operations), 2)
+
+    def test_echec_remplacement_sauvegarde_preserve_ancienne(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+        clawlab._enregistrer("operation_2", "success", 20)
+
+        backup = clawlab.JOURNAL.with_name(
+            clawlab.JOURNAL.name + ".bak"
+        )
+        sauvegarde_initiale = backup.read_bytes()
+
+        remplacement_original = clawlab.os.replace
+
+        def simuler_echec(source, destination):
+            if Path(destination) == backup:
+                raise OSError("Echec remplacement atomique")
+            return remplacement_original(source, destination)
+
+        clawlab.os.replace = simuler_echec
+        try:
+            with self.assertRaisesRegex(
+                OSError, "Echec remplacement atomique"
+            ):
+                clawlab._enregistrer("operation_3", "success", 30)
+        finally:
+            clawlab.os.replace = remplacement_original
+
+        self.assertEqual(backup.read_bytes(), sauvegarde_initiale)
+
+        operations = clawlab._charger_operations()
+        self.assertEqual(len(operations), 2)
+        self.assertEqual(operations[-1]["action"], "operation_2")
+        self.assertTrue(clawlab._verifier_liste_operations(operations))
+
+        temporaires = list(
+            backup.parent.glob("." + backup.name + ".*.tmp")
+        )
+        self.assertEqual(temporaires, [])
+
+    def test_echec_checkpoint_enregistrement_retour_arriere(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+
+        journal = clawlab.JOURNAL
+        checkpoint = clawlab._chemin_checkpoint()
+        journal_initial = journal.read_bytes()
+        checkpoint_initial = checkpoint.read_bytes()
+
+        original = clawlab._ecrire_checkpoint
+
+        def simuler_echec(operations, chemin=None):
+            if chemin is None:
+                raise OSError("Echec checkpoint enregistrement")
+            return original(operations, chemin)
+
+        clawlab._ecrire_checkpoint = simuler_echec
+        try:
+            with self.assertRaisesRegex(
+                OSError, "Echec checkpoint enregistrement"
+            ):
+                clawlab._enregistrer("operation_2", "success", 20)
+        finally:
+            clawlab._ecrire_checkpoint = original
+
+        self.assertEqual(journal.read_bytes(), journal_initial)
+        self.assertEqual(checkpoint.read_bytes(), checkpoint_initial)
+
+        operations = clawlab._charger_operations()
+        self.assertEqual(len(operations), 1)
+        self.assertEqual(operations[0]["action"], "operation_1")
+
+    def test_echec_checkpoint_restauration_retour_arriere(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+        clawlab._enregistrer("operation_2", "success", 20)
+
+        journal = clawlab.JOURNAL
+        checkpoint = clawlab._chemin_checkpoint()
+
+        journal_corrompu = b"JOURNAL CORROMPU POUR TEST"
+        journal.write_bytes(journal_corrompu)
+        checkpoint_initial = checkpoint.read_bytes()
+
+        ecriture_originale = clawlab._ecrire_checkpoint
+
+        def simuler_echec(operations, chemin=None):
+            if chemin is None:
+                raise OSError("Echec checkpoint restauration")
+            return ecriture_originale(operations, chemin)
+
+        clawlab._ecrire_checkpoint = simuler_echec
+        try:
+            with self.assertRaisesRegex(
+                OSError, "Echec checkpoint restauration"
+            ):
+                clawlab.restaurer_sauvegarde()
+        finally:
+            clawlab._ecrire_checkpoint = ecriture_originale
+
+        self.assertEqual(journal.read_bytes(), journal_corrompu)
+        self.assertEqual(checkpoint.read_bytes(), checkpoint_initial)
+
+        copies = list(
+            journal.parent.glob(journal.name + ".corrompu-*")
+        )
+        self.assertTrue(copies)
+        self.assertEqual(copies[-1].read_bytes(), journal_corrompu)
+
+    def test_sauvegarde_operations_mal_formees_rejetee(self):
+        backup = clawlab.JOURNAL.with_name(
+            clawlab.JOURNAL.name + ".bak"
+        )
+        backup.write_text(
+            '{"version":1,"operations":["operation_invalide"],"checkpoint":{}}',
+            encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "Intégrité de la sauvegarde invalide"
+        ):
+            clawlab._charger_sauvegarde(backup)
+
+    def test_checkpoint_cree(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+
+        checkpoint = clawlab.JOURNAL.with_name(
+            clawlab.JOURNAL.name + ".checkpoint"
+        )
+        self.assertTrue(checkpoint.exists())
+        donnees = json.loads(checkpoint.read_text(encoding="utf-8"))
+        self.assertEqual(donnees["version"], 2)
+        self.assertTrue(clawlab._verifier_checkpoint_signe(donnees))
+
+    def test_checkpoint_signe_refuse_reecriture_sans_cle_privee(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+        operations = clawlab._charger_operations()
+        operations[0]["action"] = "historique_falsifie"
+        operations[0]["previous_hash"] = "GENESIS"
+        contenu = {k: v for k, v in operations[0].items() if k != "hash"}
+        operations[0]["hash"] = clawlab._empreinte(contenu)
+        clawlab.JOURNAL.write_text(json.dumps(operations), encoding="utf-8")
+
+        checkpoint = clawlab._chemin_checkpoint()
+        donnees = json.loads(checkpoint.read_text(encoding="utf-8"))
+        donnees["snapshot"] = clawlab._instantane_checkpoint(operations)
+        checkpoint.write_text(json.dumps(donnees), encoding="utf-8")
+
+        self.assertTrue(clawlab._verifier_liste_operations(operations))
+        with self.assertRaisesRegex(ValueError, "Signature du checkpoint"):
+            clawlab._charger_operations()
+
+    def test_checkpoint_historique_est_migre_vers_signature(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+        checkpoint = clawlab._chemin_checkpoint()
+        checkpoint.write_text(
+            json.dumps(clawlab._instantane_checkpoint(clawlab._charger_operations())),
+            encoding="utf-8",
+        )
+
+        clawlab._charger_operations()
+
+        migre = json.loads(checkpoint.read_text(encoding="utf-8"))
+        self.assertTrue(clawlab._verifier_checkpoint_signe(migre))
+
+    def test_signature_sauvegarde_corrompue_est_refusee(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+        clawlab._enregistrer("operation_2", "success", 20)
+        backup = clawlab.JOURNAL.with_name(clawlab.JOURNAL.name + ".bak")
+        donnees = json.loads(backup.read_text(encoding="utf-8"))
+        donnees["checkpoint"]["signature"] = "A" * len(
+            donnees["checkpoint"]["signature"]
+        )
+        backup.write_text(json.dumps(donnees), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "Checkpoint signé"):
+            clawlab._charger_sauvegarde(backup)
+
+    def test_suppression_derniere_operation_detectee(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+        clawlab._enregistrer("operation_2", "success", 20)
+
+        operations = json.loads(
+            clawlab.JOURNAL.read_text(encoding="utf-8")
+        )
+        operations.pop()
+
+        clawlab.JOURNAL.write_text(
+            json.dumps(operations), encoding="utf-8"
+        )
+
+        with self.assertRaises(ValueError):
+            clawlab._charger_operations()
+
+    def test_evenement_orphelin_avec_chaine_recalculee_refuse(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+        clawlab._enregistrer("operation_2", "success", 20)
+
+        operations = clawlab._charger_operations()
+        orpheline = dict(operations[-1])
+        orpheline["id"] = "evenement-orphelin"
+        orpheline["action"] = "evenement_fabrique"
+        orpheline["previous_hash"] = operations[-1]["hash"]
+        contenu = {k: v for k, v in orpheline.items() if k != "hash"}
+        orpheline["hash"] = clawlab._empreinte(contenu)
+        operations.append(orpheline)
+
+        self.assertTrue(clawlab._verifier_liste_operations(operations))
+        clawlab.JOURNAL.write_text(
+            json.dumps(operations), encoding="utf-8"
+        )
+
+        with self.assertRaises(ValueError):
+            clawlab._charger_operations()
+
+    def test_checkpoint_manquant_est_detecte_apres_sauvegarde_versionnee(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+        clawlab._enregistrer("operation_2", "success", 20)
+
+        checkpoint = clawlab._chemin_checkpoint()
+        checkpoint.unlink()
+
+        with self.assertRaisesRegex(
+            ValueError, "Checkpoint principal absent"
+        ):
+            clawlab._charger_operations()
+
+    def test_recuperation_apres_interruption_checkpoint(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+
+        original = clawlab._ecrire_checkpoint
+
+        def simuler_interruption(operations, chemin=None):
+            if chemin is None:
+                raise OSError("Interruption simulee")
+            return original(operations, chemin)
+
+        clawlab._ecrire_checkpoint = simuler_interruption
+        try:
+            with self.assertRaisesRegex(OSError, "Interruption simulee"):
+                clawlab._enregistrer("operation_2", "success", 20)
+        finally:
+            clawlab._ecrire_checkpoint = original
+
+        operations = clawlab._charger_operations()
+        self.assertEqual(len(operations), 1)
+        self.assertEqual(operations[0]["action"], "operation_1")
+        self.assertTrue(clawlab._verifier_liste_operations(operations))
+        self.assertFalse(clawlab.restaurer_sauvegarde())
+
+    def test_checkpoint_sauvegarde_associe(self):
+        clawlab._enregistrer("operation_1", "success", 10)
+        clawlab._enregistrer("operation_2", "success", 20)
+
+        backup = clawlab.JOURNAL.with_name(
+            clawlab.JOURNAL.name + ".bak"
+        )
+        donnees = json.loads(backup.read_text(encoding="utf-8"))
+        self.assertEqual(donnees["version"], 2)
+        self.assertEqual(
+            donnees["checkpoint"]["snapshot"],
+            clawlab._instantane_checkpoint(donnees["operations"])
+        )
+        self.assertTrue(
+            clawlab._verifier_liste_operations(donnees["operations"])
+        )

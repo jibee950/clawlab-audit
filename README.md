@@ -129,6 +129,20 @@ verifier_integrite()
 
 The journal uses a SHA-256 hash chain to help detect modifications to recorded entries.
 
+## What an audit report proves
+
+ClawLab records executions that pass through its Python decorator. A valid journal shows that its stored entries are structurally consistent with the local integrity checks. It does not independently observe every action an agent takes.
+
+In particular, a valid report does **not** prove that:
+
+- every real tool call was captured or that an agent did not bypass the decorator;
+- a journal entry came directly from a raw tool event rather than from application code;
+- the tool result was correct for the business task (for example, that a payment went to the intended account);
+- the signing key was not compromised or replaced along with the journal and checkpoint;
+- the machine's clock or the report's timestamp was independently trusted.
+
+For stronger provenance, an integration must capture events at the tool boundary and compare the audit record with an independently controlled source. ClawLab does not currently provide remote attestation, a hardware trust anchor or an external timestamping service.
+
 ## Search and inspect operations
 
 Find an operation by its identifier:
@@ -254,7 +268,13 @@ ClawLab Audit is designed with local-first data storage.
 - **Privacy:** no journal data is transmitted to external services.
 - **Recovery:** local backups help protect against accidental data loss.
 
-The integrity mechanism is designed to detect modifications, not to provide tamper-proof or certified security. An attacker with direct access to the journal could rewrite it and recompute its hashes.
+ClawLab signs each checkpoint with a local Ed25519 key. The private key is kept separately from the journal at `~/.config/clawlab/audit_signing_key.pem`; checkpoints and backups contain signatures, not the private key. This detects a rewritten journal and checkpoint when the signing key remains unchanged.
+
+Keep a protected copy of the signing key: losing it makes existing signed checkpoints unverifiable. A process or user that can replace the signing key as well as the journal and checkpoint can still forge a new history. For protection against that stronger attacker, keep a trusted public-key fingerprint or signed checkpoint outside this machine. A signature proves which local key signed a checkpoint; it does not prove that an event came from a genuine external action.
+
+ClawLab migrates valid unsigned checkpoints from older versions to signed checkpoints on read. It does not silently migrate a corrupted checkpoint or a journal that disagrees with its checkpoint.
+
+Adversarial scenarios and the evidence ClawLab would need before making stronger claims are tracked in [BETA_FEEDBACK.md](BETA_FEEDBACK.md).
 
 ## Built for developers
 
@@ -287,6 +307,10 @@ See the `LICENSE` file for details.
 
 ## Version
 
-Current release version: **0.2.0**
+Latest version published on PyPI: **0.2.0**
 
-This release includes expanded auditing, reporting and anomaly detection features.
+GitHub source version: **0.3.0** (tag `v0.3.0`; not published to PyPI).
+
+Version 0.3.0 adds locally signed Ed25519 checkpoints, strengthens recovery,
+and extends adversarial and concurrency coverage. See [CHANGELOG.md](CHANGELOG.md)
+for details.
